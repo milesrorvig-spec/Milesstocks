@@ -1,0 +1,282 @@
+import re
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+
+POSITIVE_WORDS = {
+    "beat",
+    "beats",
+    "bullish",
+    "buy",
+    "climb",
+    "climbs",
+    "growth",
+    "gain",
+    "gains",
+    "high",
+    "improve",
+    "improves",
+    "improved",
+    "innovation",
+    "launch",
+    "leads",
+    "outperform",
+    "profit",
+    "profits",
+    "record",
+    "rise",
+    "rises",
+    "strong",
+    "surge",
+    "surges",
+    "up",
+    "upgrade",
+    "upside",
+    "win",
+    "wins",
+}
+
+NEGATIVE_WORDS = {
+    "bearish",
+    "cut",
+    "cuts",
+    "concern",
+    "concerns",
+    "crash",
+    "crashes",
+    "decline",
+    "declines",
+    "delay",
+    "drop",
+    "drops",
+    "down",
+    "downgrade",
+    "fall",
+    "falls",
+    "fear",
+    "loss",
+    "losses",
+    "lawsuit",
+    "miss",
+    "misses",
+    "plunge",
+    "plunges",
+    "risk",
+    "risks",
+    "sell",
+    "slump",
+    "slumps",
+    "weak",
+    "worse",
+}
+
+
+def get_stock_data(ticker: str) -> pd.DataFrame | None:
+    stock = yf.Ticker(ticker)
+    df = stock.history(period="3mo", auto_adjust=False)
+    if df is None or df.empty:
+        return None
+    return df
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["SMA_20"] = df["Close"].rolling(20).mean()
+    df["SMA_50"] = df["Close"].rolling(50).mean()
+
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    return df
+
+
+def score_text(text: str) -> float:
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    if not words:
+        return 0.0
+
+    positive_hits = sum(word in POSITIVE_WORDS for word in words)
+    negative_hits = sum(word in NEGATIVE_WORDS for word in words)
+    total_hits = positive_hits + negative_hits
+
+    if total_hits == 0:
+        return 0.0
+
+    return (positive_hits - negative_hits) / total_hits
+
+
+def get_news_sentiment(ticker: str) -> tuple[float, list[str]]:
+    try:
+        news_items = yf.Ticker(ticker).news
+    except Exception:
+        return 0.0, []
+
+    if not news_items:
+        return 0.0, []
+
+    headlines = []
+    scores = []
+
+    for item in news_items[:10]:
+        title = item.get("title", "").strip()
+        summary = item.get("summary", "").strip()
+        text = f"{title} {summary}".strip()
+        if not text:
+            continue
+        headlines.append(title or "Untitled article")
+        scores.append(score_text(text))
+
+    return (float(np.mean(scores)) if scores else 0.0), headlines
+
+
+def analyze_candles(df: pd.DataFrame) -> str:
+    if len(df) < 2:
+        return "Not enough data"
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    body = abs(latest["Close"] - latest["Open"])
+    candle_range = latest["High"] - latest["Low"]
+
+    if candle_range == 0:
+        return "No pattern"
+
+    ratio = body / candle_range
+
+    if ratio < 0.1:
+        return "Doji (Indecision)"
+
+    if (
+        latest["Close"] > latest["Open"]
+        and prev["Close"] < prev["Open"]
+        and latest["Close"] > prev["Open"]
+        and latest["Open"] < prev["Close"]
+    ):
+        return "Bullish Engulfing"
+
+    if (
+        latest["Close"] < latest["Open"]
+        and prev["Close"] > prev["Open"]
+        and latest["Close"] < prev["Open"]
+        and latest["Open"] > prev["Close"]
+    ):
+        return "Bearish Engulfing"
+
+    return "Neutral"
+
+
+def generate_signal(df: pd.DataFrame, sentiment: float) -> str:
+    latest = df.iloc[-1]
+
+    bullish_trend = latest["SMA_20"] > latest["SMA_50"]
+    bearish_trend = latest["SMA_20"] < latest["SMA_50"]
+    rsi = latest["RSI"]
+    macd = latest["MACD"]
+    signal = latest["Signal"]
+
+    if pd.isna([latest["SMA_20"], latest["SMA_50"], rsi, macd, signal]).any():
+        return "HOLD / WAIT"
+
+    if bullish_trend and rsi < 70 and macd > signal and sentiment >= 0:
+        return "STRONG BUY"
+
+    if bearish_trend and rsi > 30 and macd < signal and sentiment < 0:
+        return "STRONG SELL"
+
+    return "HOLD / WAIT"
+
+
+st.set_page_config(page_title="AI Stock Analyzer Pro", layout="centered")
+
+st.title("AI Stock Analyzer Pro")
+st.write("Works with regular Python and Streamlit. No API key needed.")
+
+ticker = st.text_input("Stock ticker", placeholder="AAPL").strip().upper()
+
+if st.button("Analyze"):
+    if not ticker:
+        st.warning("Enter a stock ticker.")
+        st.stop()
+
+    with st.spinner("Running analysis..."):
+        df = get_stock_data(ticker)
+        if df is None:
+            st.error("No stock data found for that ticker.")
+            st.stop()
+
+        df = add_indicators(df)
+        sentiment, headlines = get_news_sentiment(ticker)
+        candle = analyze_candles(df)
+        signal = generate_signal(df, sentiment)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Candles",
+        )
+    )
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_20"], name="SMA 20"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_50"], name="SMA 50"))
+    fig.update_layout(
+        title=f"{ticker} Price Chart",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        xaxis_rangeslider_visible=False,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Indicators")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("RSI", f"{df['RSI'].iloc[-1]:.2f}" if pd.notna(df["RSI"].iloc[-1]) else "N/A")
+    col2.metric("MACD", f"{df['MACD'].iloc[-1]:.2f}" if pd.notna(df["MACD"].iloc[-1]) else "N/A")
+    col3.metric(
+        "Signal Line",
+        f"{df['Signal'].iloc[-1]:.2f}" if pd.notna(df["Signal"].iloc[-1]) else "N/A",
+    )
+
+    st.subheader("News Sentiment")
+    if sentiment > 0.2:
+        st.success(f"{sentiment:.2f}")
+    elif sentiment < -0.2:
+        st.error(f"{sentiment:.2f}")
+    else:
+        st.info(f"{sentiment:.2f}")
+
+    if headlines:
+        st.caption("Recent Yahoo Finance headlines used for sentiment")
+        for headline in headlines[:5]:
+            st.write(f"- {headline}")
+    else:
+        st.caption("No recent headlines available from Yahoo Finance for this ticker.")
+
+    st.subheader("Candle Pattern")
+    st.write(candle)
+
+    st.subheader("AI Decision")
+    if signal == "STRONG BUY":
+        st.success(signal)
+    elif signal == "STRONG SELL":
+        st.error(signal)
+
+    else:
+        st.info(signal)
